@@ -1,0 +1,14 @@
+name: Hello PR Check
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  say-hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print PR info
+        run: |
+          echo "Hello! A PR was just opened or updated."
+          echo "PR number is: ${{ github.event.pull_request.number }}"
