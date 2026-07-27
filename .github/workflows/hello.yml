@@ -8,7 +8,16 @@ jobs:
   say-hello:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Print PR info
         run: |
           echo "Hello! A PR was just opened or updated."
           echo "PR number is: ${{ github.event.pull_request.number }}"
+
+      - name: Show the diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD
