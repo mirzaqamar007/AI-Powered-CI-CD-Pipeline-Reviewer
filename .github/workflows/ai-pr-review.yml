@@ -1,0 +1,172 @@
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# The default token is read-only on public forks; this grants the write scope
+# the review comment needs.
+permissions:
+  contents: read
+  pull-requests: write
+
+# A new push supersedes the review in flight for the same PR.
+concurrency:
+  group: ai-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review the diff
+    # Drafts are still being written; reviewing them is noise. The workflow
+    # runs again on `ready_for_review`.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect the diff
+        id: diff
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "$BASE_REF"
+          MERGE_BASE="$(git merge-base "origin/$BASE_REF" HEAD)"
+          echo "Comparing against $BASE_REF at $MERGE_BASE"
+
+          # Lockfiles, vendored trees, and build output dominate a diff without
+          # telling a reviewer anything. Keep them out of both lists below.
+          # The `glob` magic matters: without it a leading `**/` requires a
+          # directory, so a root-level package-lock.json slips through.
+          EXCLUDES=(
+            ':(exclude,glob)**/package-lock.json'
+            ':(exclude,glob)**/yarn.lock'
+            ':(exclude,glob)**/pnpm-lock.yaml'
+            ':(exclude,glob)**/poetry.lock'
+            ':(exclude,glob)**/Cargo.lock'
+            ':(exclude,glob)**/go.sum'
+            ':(exclude,glob)**/composer.lock'
+            ':(exclude,glob)**/Gemfile.lock'
+            ':(exclude,glob)vendor/**'
+            ':(exclude,glob)node_modules/**'
+            ':(exclude,glob)dist/**'
+            ':(exclude,glob)build/**'
+            ':(exclude,glob)**/*.min.js'
+            ':(exclude,glob)**/*.min.css'
+            ':(exclude,glob)**/*.map'
+            ':(exclude,glob)**/*.snap'
+            ':(exclude,glob)**/*.pb.go'
+            ':(exclude,glob)**/*_pb2.py'
+          )
+
+          git diff --name-only -M "$MERGE_BASE" HEAD -- "${EXCLUDES[@]}" > changed_files.txt
+          FILE_COUNT="$(wc -l < changed_files.txt | tr -d ' ')"
+          echo "Reviewable files changed: $FILE_COUNT"
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "No reviewable files — skipping."
+            echo "skip=no-code-changes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Prose changes don't need a code review.
+          if ! grep -qvE '(^|/)(docs|\.github)/|\.(md|markdown|rst|txt)$|^(LICENSE|CODEOWNERS)$' changed_files.txt; then
+            echo "Documentation-only change — skipping."
+            echo "skip=docs-only" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Text diff only; binaries would just be noise in the prompt.
+          git diff -M --unified=3 --no-color "$MERGE_BASE" HEAD -- "${EXCLUDES[@]}" > pr.diff
+
+          echo "skip=" >> "$GITHUB_OUTPUT"
+          echo "Diff size: $(wc -c < pr.diff) bytes"
+          git diff --stat -M "$MERGE_BASE" HEAD -- "${EXCLUDES[@]}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check for the API key
+        id: key
+        if: steps.diff.outputs.skip == ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::warning::ANTHROPIC_API_KEY is not configured; skipping the review."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.key.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        if: steps.key.outputs.present == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Ask Claude to review the diff
+        id: review
+        if: steps.key.outputs.present == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python scripts/review_pr.py \
+            --diff pr.diff \
+            --output review.md \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY"
+
+      - name: Post the review
+        if: steps.review.outcome == 'success' && hashFiles('review.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # The marker lets a later run update this comment instead of stacking
+          # a new one on every push.
+          MARKER='<!-- ai-pr-review -->'
+          printf '%s\n\n' "$MARKER" > comment.md
+          cat review.md >> comment.md
+
+          EXISTING="$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq "[.[] | select(.body | startswith(\"$MARKER\")) | .id] | first // empty")"
+
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -F body=@comment.md > /dev/null
+            echo "Updated comment $EXISTING."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@comment.md > /dev/null
+            echo "Posted a new review comment."
+          fi
+
+      - name: Note that the review was skipped
+        if: steps.diff.outputs.skip != '' || steps.key.outputs.present == 'false'
+        run: |
+          echo "Review skipped: ${{ steps.diff.outputs.skip || 'missing-api-key' }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a failed review
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+            -f body="<!-- ai-pr-review-error --> The AI review did not finish. [See the run log]($RUN_URL)." \
+            > /dev/null || echo "::warning::Could not post the failure notice."

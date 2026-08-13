@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Workflow artifacts produced by the reviewer
+pr.diff
+review.md
+comment.md
+changed_files.txt
+
+# Local secrets
+.env
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
