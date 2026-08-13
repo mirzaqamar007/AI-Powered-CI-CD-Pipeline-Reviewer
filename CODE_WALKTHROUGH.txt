@@ -1,0 +1,916 @@
+===============================================================================
+CODE WALKTHROUGH - AI-Powered CI/CD Pipeline Reviewer
+===============================================================================
+
+A line-by-line explanation of every file in this repository.
+
+Repository : AI-Powered-CI-CD-Pipeline-Reviewer
+Commit     : 1ad105e (branch stage2-diff-printing)
+
+Files covered:
+
+  1. scripts/review_pr.py .................. 235 lines  (the reviewer)
+  2. .github/workflows/ai-pr-review.yml .... 173 lines  (the automation)
+  3. requirements.txt ...................... 1 line
+  4. .gitignore ............................ 21 lines
+  5. LICENSE ............................... MIT
+  6. README.md ............................. project documentation
+
+
+-------------------------------------------------------------------------------
+HOW THE PIECES FIT TOGETHER
+-------------------------------------------------------------------------------
+
+    A pull request is opened, or new commits are pushed
+                        |
+                        v
+    [workflow]  Check out the repository with full git history
+                        |
+                        v
+    [workflow]  Build a diff against the merge base, with lockfiles,
+                vendored code and build output filtered out
+                        |
+                        v
+    [workflow]  Decide whether this PR is worth reviewing at all
+                (drafts, docs-only changes and empty diffs are skipped)
+                        |
+                        v
+    [script]    Trim the diff to a size budget, send it to Claude,
+                write the review to review.md
+                        |
+                        v
+    [workflow]  Post review.md as a PR comment - or update the comment
+                posted by a previous run
+
+The split matters: the SCRIPT knows nothing about GitHub, and the WORKFLOW
+knows nothing about Claude. You can run the script by hand against any diff
+on your laptop, and you could swap the workflow for GitLab CI without
+touching the script.
+
+
+===============================================================================
+1. scripts/review_pr.py
+===============================================================================
+
+Reads a diff from a file, asks Claude to review it, writes the answer to
+another file. That is the whole job.
+
+
+-------------------------------------------------------------------------------
+Lines 1-19   Header and imports
+-------------------------------------------------------------------------------
+
+  1   #!/usr/bin/env python3
+
+      The shebang line. The file has mode 100755 (executable), so you can run
+      ./scripts/review_pr.py directly and the operating system will find
+      Python on your PATH.
+
+  2-11 """Send a pull request diff to Claude ... """
+
+      The module docstring. argparse reuses this text as the --help output on
+      line 162, so it serves as both documentation and CLI help.
+
+  8-10     Exit codes:
+               0  A review was written (or the diff was empty).
+               1  Something went wrong; stderr explains what.
+
+      The exit-code contract, written down because the workflow depends on
+      it. 0 means "carry on", 1 means "stop and report a failure".
+
+  13  from __future__ import annotations
+
+      Makes type hints lazy strings instead of evaluated objects. This is
+      what allows line 73 to write list[tuple[str, str]] without importing
+      anything from the typing module.
+
+  15  import argparse      - parses the command-line flags
+  16  import os            - reads the API key from the environment
+  17  import sys           - writes to stderr and sets the exit code
+
+  19  import anthropic
+
+      The only third-party dependency: the official Anthropic SDK. Kept in a
+      separate import group by Python convention (standard library first,
+      then third-party).
+
+
+-------------------------------------------------------------------------------
+Lines 21-30   The four configuration knobs
+-------------------------------------------------------------------------------
+
+  21  MODEL = "claude-opus-5"
+
+      Which model writes the review. Everything else in the file is
+      model-agnostic, so this single string is the whole switch.
+
+  25  PER_FILE_CHAR_LIMIT = 20_000
+
+      No single file may contribute more than 20,000 characters to the
+      prompt. Without this cap, one enormous generated file could consume
+      the entire budget and crowd out every other file in the PR.
+
+  26  TOTAL_CHAR_LIMIT = 240_000
+
+      The whole diff is capped at 240,000 characters - roughly 60,000-80,000
+      tokens, which sits comfortably inside the context window with room
+      left for the reply.
+
+  30  MAX_TOKENS = 32_000
+
+      The output ceiling. This is larger than it first appears to need,
+      because Opus 5 reasons before it answers and that reasoning is billed
+      against the SAME budget as the visible text. Set this to 4,000 and a
+      long review gets cut off mid-sentence.
+
+      Note on syntax: 20_000 and 20000 are the same number to Python. The
+      underscore is a thousands separator for human readability only.
+
+
+-------------------------------------------------------------------------------
+Lines 32-57   SYSTEM_PROMPT - the standing instructions
+-------------------------------------------------------------------------------
+
+  32  SYSTEM_PROMPT = """\
+
+      A triple-quoted string. The backslash at the end of each line joins it
+      to the next without inserting a line break, so the source code can wrap
+      at 88 columns while the prompt Claude actually receives reads as normal
+      flowing paragraphs.
+
+  33-35  "You see only the diff, not the full repository..."
+
+      Tells the model what it CANNOT see. A diff shows changed lines plus a
+      few lines of surrounding context, not the rest of the codebase. This
+      instruction asks the model to say so when a judgement depends on code
+      it was not shown, rather than guessing.
+
+  37-39  "Report every issue you find, including ones you are uncertain
+          about. Do not filter for importance..."
+
+      Deliberately asks for COVERAGE over selectivity. Telling a capable
+      model to "only report important issues" makes it quietly drop real
+      findings it judged to be below the bar. It is better to receive
+      everything and let a human decide what matters.
+
+  41-54  The required Markdown shape (## Summary / ## Findings / ## Notes)
+
+      Pins the output format, because the result goes straight into a GitHub
+      comment with no post-processing. Fixed headings mean every comment
+      looks the same, and the per-finding severity labels make it skimmable.
+
+  56  "Skip praise and preamble. If the diff is trivial, keep it short."
+
+      Suppresses the "Great work! Here is a thorough review..." opening, and
+      lets a one-line PR receive a one-line review.
+
+
+-------------------------------------------------------------------------------
+Lines 59-70   USER_TEMPLATE - the per-request message
+-------------------------------------------------------------------------------
+
+  59  USER_TEMPLATE = """\
+
+      The shape of every request. Kept as a module-level constant rather than
+      built inline, so the prompt is readable in one place.
+
+  62-64  Title: {title} / Description: {body}
+
+      The PR title and description give the model the author's INTENT. The
+      diff shows what changed; the description usually explains why. Having
+      both is what lets a reviewer say "this does not do what you said it
+      would".
+
+  67-69  ```diff ... ```
+
+      Fencing the diff in a Markdown code block marks unambiguously where the
+      data starts and ends, so a stray line inside the diff cannot be
+      mistaken for an instruction.
+
+  70  {truncation_note}
+
+      Filled in only when something was trimmed (see line 120). When nothing
+      was cut this is an empty string and leaves no trace.
+
+
+-------------------------------------------------------------------------------
+Lines 73-92   split_by_file() - cutting the diff into per-file chunks
+-------------------------------------------------------------------------------
+
+  73  def split_by_file(diff: str) -> list[tuple[str, str]]:
+
+      Takes one large diff string and returns a list of (path, chunk) pairs,
+      one pair per changed file.
+
+  75-77  chunks / current_path / current
+
+      Three accumulators: the finished chunks, the path of the file currently
+      being read, and the lines collected so far for that file.
+
+  79  for line in diff.splitlines(keepends=True):
+
+      keepends=True retains the newline character on each line, so rejoining
+      the list with "".join() on line 82 reproduces the original text exactly.
+
+  80  if line.startswith("diff --git "):
+
+      Git begins every file's section with a line reading
+      "diff --git a/path b/path". That prefix is the delimiter this function
+      splits on.
+
+  81-82  if current: chunks.append(...)
+
+      On reaching a new file header, flush whatever has accumulated. The
+      "if current" guard prevents an empty chunk being emitted before the
+      very first file header.
+
+  83  current = [line]
+
+      Start the next chunk, keeping the header line itself - the model
+      benefits from seeing which file it is looking at.
+
+  85-86  parts = line.split(" b/", 1)
+         current_path = parts[1].strip() if len(parts) == 2 else "unknown"
+
+      Extract the destination path. The "1" limits the split to one, so a
+      filename that itself contains " b/" cannot corrupt the result. If the
+      header is malformed, fall back to "unknown" rather than crashing.
+
+  88  current.append(line)
+
+      Any line that is not a file header belongs to the file being read.
+
+  90-91  if current: chunks.append(...)
+
+      IMPORTANT. The loop only flushes a chunk when it ENCOUNTERS the next
+      header, so the final file is still sitting in the buffer when the loop
+      ends. Without these two lines, the last file of every PR would silently
+      vanish from the review.
+
+
+-------------------------------------------------------------------------------
+Lines 95-113   trim() - enforcing the size budget
+-------------------------------------------------------------------------------
+
+  95  def trim(diff: str) -> tuple[str, list[str]]:
+
+      Returns two things: the trimmed diff, and a list of human-readable
+      notes describing what was cut. Nothing is ever dropped silently.
+
+  97-99  notes / kept / used
+
+      notes records the cuts, kept collects the surviving chunks, used tracks
+      the running character count.
+
+ 102-104  if len(chunk) > PER_FILE_CHAR_LIMIT:
+
+      Rule one: no single file exceeds its per-file cap. The chunk is sliced
+      and stamped with a visible "[file diff truncated]" marker, so the model
+      knows it is looking at a fragment.
+
+ 106-108  if used + len(chunk) > TOTAL_CHAR_LIMIT: ... continue
+
+      Rule two: stop accepting files once the total budget would be exceeded.
+      Note "continue", not "break" - this file is skipped but the loop keeps
+      going, so a later smaller file can still fit. Using break instead would
+      discard everything after the first oversized file.
+
+ 110-111  kept.append(chunk); used += len(chunk)
+
+      Accept the chunk and add its length to the running total.
+
+ 113  return "".join(kept), notes
+
+      Rejoin the survivors into a single string. In testing, a synthetic
+      20-file diff came back with 11 files kept and 9 named as omitted.
+
+      Why characters and not tokens: characters are a cheap local measure,
+      whereas counting real tokens would require a network call per file. The
+      caps are conservative enough that the proxy has plenty of headroom.
+
+
+-------------------------------------------------------------------------------
+Lines 116-129   build_prompt() - assembling the message
+-------------------------------------------------------------------------------
+
+ 117  trimmed, notes = trim(diff)
+
+      Trim first, so the template is filled with content that already fits.
+
+ 118-122  if notes: note_text = "This diff was trimmed..." + bullet list
+
+      If anything was cut, tell the model so. This matters more than it
+      looks: a model that believes it saw a whole file will confidently claim
+      a function is never called, when in fact the call site was trimmed away.
+
+ 124-125  title=title or "(no title)"
+          body=(body or "(no description)").strip()
+
+      The "or" idiom substitutes a placeholder when the value is empty.
+      GitHub sends an empty body for a PR with no description, and
+      ("" or "(no description)") evaluates to the placeholder. .strip()
+      removes stray leading and trailing blank lines.
+
+ 129  return prompt, notes
+
+      The notes are returned alongside the prompt because main() uses them
+      again on line 219, to build the footer of the PR comment.
+
+
+-------------------------------------------------------------------------------
+Lines 132-158   request_review() - the API call
+-------------------------------------------------------------------------------
+
+ 134-140  params = dict(...)
+
+      The request, built once as a dictionary so that both attempts below
+      send identical parameters. "system" carries the standing instructions;
+      "messages" carries this particular PR's data.
+
+ 138  output_config={"effort": "high"}
+
+      Effort controls how hard the model works before answering. "high" costs
+      more and takes longer than the lower settings - a reasonable trade when
+      the output is a code review a human will act on.
+
+ 148  with client.beta.messages.stream(...)
+
+      STREAMING, not a plain request. A long review can take minutes, and a
+      non-streaming HTTP call risks hitting a timeout. Streaming keeps the
+      connection alive for the whole generation.
+
+ 149-150  betas=["server-side-fallback-2026-07-01"]
+          fallbacks="default"
+
+      Safety classifiers occasionally decline a request - a security fix that
+      touches exploit-shaped code is the realistic case here. Setting
+      fallbacks="default" re-serves the request on another model inside the
+      same call, so a false positive does not kill the review.
+
+ 151  **params
+
+      Unpacks the dictionary into keyword arguments.
+
+ 153  return stream.get_final_message()
+
+      Waits for the stream to finish and returns the assembled message.
+      Nothing is printed while streaming - this runs in CI, not a chat window.
+
+ 154-155  except (TypeError, anthropic.BadRequestError)
+
+      Two ways the fallback parameter can fail: an older SDK does not
+      recognise it (TypeError), or the account lacks access to the beta
+      (BadRequestError). Both are caught and logged rather than being fatal.
+
+ 157-158  with client.messages.stream(**params) as stream:
+
+      The retry without the beta parameter. Only reached via the except
+      clause above, because line 153 returns on the happy path - so this
+      never runs twice.
+
+
+-------------------------------------------------------------------------------
+Lines 161-188   main() - setup and input validation
+-------------------------------------------------------------------------------
+
+ 161  def main() -> int:
+
+      Returns an int rather than calling sys.exit() directly, which keeps the
+      function testable. The actual exit happens once, on line 234.
+
+ 163-166  Four flags: --diff, --output, --title, --body
+
+      The two file paths are required. Title and body default to empty,
+      because a pull request may legitimately have neither.
+
+ 169-171  if not os.environ.get("ANTHROPIC_API_KEY"): return 1
+
+      Fail fast on a missing key, before doing any other work. Note the key
+      is read from the ENVIRONMENT and never accepted as a flag - flags show
+      up in process listings and CI logs, environment variables do not.
+
+ 174  with open(args.diff, encoding="utf-8", errors="replace") as handle:
+
+      errors="replace" is load-bearing. A diff can contain any byte sequence,
+      and a single invalid UTF-8 character would otherwise crash the run.
+      Invalid bytes become the Unicode replacement character instead.
+
+ 176-178  except OSError
+
+      Catches every filesystem failure: missing file, no permission, a
+      directory where a file was expected.
+
+ 180-182  if not diff.strip(): return 0
+
+      Returns 0, NOT 1. An empty diff means the workflow's filters removed
+      everything, which is a perfectly normal outcome rather than a failure.
+      Returning 1 here would mark healthy pull requests as broken.
+
+ 185-186  for note in notes: print(...)
+
+      Echo any trimming notes into the job log, so truncation is visible to
+      whoever later debugs a surprising review.
+
+ 188  client = anthropic.Anthropic()
+
+      The client constructor takes no arguments - it locates
+      ANTHROPIC_API_KEY in the environment by itself.
+
+
+-------------------------------------------------------------------------------
+Lines 190-220   main() - calling out and reading the answer
+-------------------------------------------------------------------------------
+
+ 190-196  client.messages.count_tokens(...)
+
+      Counts the prompt's tokens purely for the log. Useful when someone asks
+      why one pull request cost more to review than another.
+
+ 197-198  except anthropic.APIError
+
+      Wrapped in its own try block because this is diagnostics only. If the
+      token count fails, the review should still go ahead.
+
+ 200-204  message = request_review(client, prompt)
+
+      The real call. Any API failure - authentication, rate limit, outage -
+      is reported with its message and exits 1, which trips the workflow's
+      failure handler.
+
+ 206-209  if message.stop_reason == "refusal":
+
+      A REFUSAL IS AN HTTP 200, NOT AN ERROR. If the fallback on line 150
+      also declined, stop_reason is "refusal" and content may be empty.
+      Checking this BEFORE line 211 is what prevents an IndexError on what
+      is technically a valid response.
+
+ 207  detail = getattr(message.stop_details, "explanation", None) or "..."
+
+      getattr with a None default guards against stop_details being absent
+      entirely; the "or" supplies wording when it exists but carries no
+      explanation.
+
+ 211  review = "\n".join(b.text for b in message.content
+                         if b.type == "text").strip()
+
+      A response is a list of typed blocks - reasoning blocks and text
+      blocks. This keeps only the text blocks and joins them, which is why
+      the model's reasoning never leaks into the PR comment.
+
+ 216-217  if message.stop_reason == "max_tokens":
+
+      If the output ceiling was hit, the review is truncated - so say so in
+      the comment, rather than letting it end mid-sentence with no
+      explanation.
+
+ 219-220  The footer
+
+      A horizontal rule, the name of the model that wrote the review, and any
+      trimming notes as a blockquote. This is the mechanism that stops a
+      partial review from reading like a complete one.
+
+
+-------------------------------------------------------------------------------
+Lines 222-235   main() - writing out, and the entry point
+-------------------------------------------------------------------------------
+
+ 223-224  with open(args.output, "w", encoding="utf-8") as handle:
+
+      Write the review to the path given by --output. The trailing newline
+      follows the POSIX convention for text files.
+
+ 225-227  except OSError: return 1
+
+      A failed write is fatal - otherwise the workflow would try to post a
+      file that does not exist.
+
+ 229  print(..., file=sys.stderr)
+
+      EVERY diagnostic in this script goes to stderr, which keeps stdout
+      clean. That is what makes the script safe to pipe into another command.
+
+ 230  return 0            Success.
+
+ 233-234  if __name__ == "__main__": sys.exit(main())
+
+      The standard entry-point guard: run main() only when the file is
+      executed directly, not when it is imported by another module.
+      sys.exit() converts the returned integer into the process exit code
+      that the workflow reads.
+
+
+===============================================================================
+2. .github/workflows/ai-pr-review.yml
+===============================================================================
+
+The part that knows about GitHub. It decides when to run, builds the diff,
+calls the script, and posts the result. Most of its length is spent deciding
+NOT to review - on drafts, documentation, and lockfiles.
+
+
+-------------------------------------------------------------------------------
+Lines 1-16   Triggers and guarantees
+-------------------------------------------------------------------------------
+
+   1  name: AI PR Review
+
+      The name shown in the Actions tab and in the PR's list of checks.
+
+   4-5  types: [opened, synchronize, reopened, ready_for_review]
+
+      Four trigger events:
+        opened            - a new pull request
+        synchronize       - NEW COMMITS PUSHED (the most common trigger)
+        reopened          - a closed PR was reopened
+        ready_for_review  - a draft was promoted, which pairs with the
+                            draft check on line 23
+
+  10-11  permissions: contents: read / pull-requests: write
+
+      Least privilege for the automatic token: read to clone, write to
+      comment, and nothing else - so a compromised dependency cannot push
+      code. This scope is also required because the default token is
+      read-only on public forks.
+
+  15  group: ai-pr-review-${{ github.event.pull_request.number }}
+
+      The concurrency group is keyed to the PR number, so each pull request
+      gets its own lane and different PRs never block one another.
+
+  16  cancel-in-progress: true
+
+      Pushing twice in quick succession cancels the first review, which is
+      already reviewing stale code. Saves both API spend and a confusing
+      out-of-date comment.
+
+
+-------------------------------------------------------------------------------
+Lines 18-41   The job, and locating the diff
+-------------------------------------------------------------------------------
+
+  23  if: github.event.pull_request.draft == false
+
+      Skips drafts entirely. Combined with the ready_for_review trigger
+      above, the review arrives the moment the draft flag is removed.
+
+  28-30  uses: actions/checkout@v4 / fetch-depth: 0
+
+      fetch-depth: 0 IS ESSENTIAL. The default shallow clone fetches a single
+      commit, and git merge-base needs real history to work. Without this
+      line, line 40 fails.
+
+  33  id: diff
+
+      The step id is how later steps read this step's outputs, as in
+      steps.diff.outputs.skip.
+
+  35  BASE_REF: ${{ github.event.pull_request.base.ref }}
+
+      The base branch name arrives through an env variable rather than being
+      interpolated directly into the shell script. This is the standard
+      defence against script injection via attacker-controlled branch names.
+
+  37  set -euo pipefail
+
+      -e            exit immediately on any error
+      -u            treat undefined variables as an error
+      -o pipefail   catch failures anywhere in a pipeline
+
+      Without this, a failing git command would be ignored and the job would
+      continue with an empty diff.
+
+  39  git fetch --no-tags origin "$BASE_REF"
+
+      Fetch the base branch. The checkout gave us the PR branch, not the
+      branch it will eventually merge into.
+
+  40  MERGE_BASE="$(git merge-base "origin/$BASE_REF" HEAD)"
+
+      THE MERGE BASE IS THE CORRECT COMPARISON POINT - the commit where this
+      branch diverged from the base. Comparing against the current tip of
+      main instead would show everything other people merged in the meantime
+      as though it were part of this pull request.
+
+
+-------------------------------------------------------------------------------
+Lines 47-66   EXCLUDES - what never reaches the model
+-------------------------------------------------------------------------------
+
+  47  EXCLUDES=( ... )
+
+      A bash array of git "pathspecs", reused by all three git commands
+      below so that the file list and the diff always agree with each other.
+
+  48-55  Lockfiles across eight ecosystems
+
+      package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock, Cargo.lock,
+      go.sum, composer.lock, Gemfile.lock. A dependency bump can add
+      thousands of lines that tell a reviewer nothing.
+
+  56-59  vendor/, node_modules/, dist/, build/
+
+      Vendored dependencies and build output - code that exists in the
+      repository but that nobody wrote by hand.
+
+  60-65  *.min.js, *.min.css, *.map, *.snap, *.pb.go, *_pb2.py
+
+      Minified assets, source maps, test snapshots, and generated protobuf
+      bindings.
+
+      A BUG THIS FIXED: these were first written as ':(exclude)**/...'
+      without the "glob" flag. In git's default pathspec mode a leading '**/'
+      REQUIRES a directory, so a repository-root package-lock.json matched
+      nothing and sailed straight through into the prompt. Adding "glob"
+      makes '**/' mean "at any depth, including none". Found by testing the
+      pathspecs directly against a scratch repository.
+
+
+-------------------------------------------------------------------------------
+Lines 68-90   Three decisions
+-------------------------------------------------------------------------------
+
+  68  git diff --name-only -M "$MERGE_BASE" HEAD -- "${EXCLUDES[@]}"
+
+      List file names only, with the exclusions applied. -M enables rename
+      detection, so a moved file appears as a rename rather than as a full
+      delete plus a full add.
+
+  69  FILE_COUNT="$(wc -l < changed_files.txt | tr -d ' ')"
+
+      Count the lines. "tr -d ' '" strips the padding that some wc
+      implementations add, which would otherwise break the numeric
+      comparison on line 72.
+
+  72-76  DECISION ONE: nothing left after filtering
+
+      A lockfile-only pull request. Record the reason and exit 0 - a clean
+      skip, not a failure.
+
+  79  if ! grep -qvE '(^|/)(docs|\.github)/|\.(md|...)$|^(LICENSE|...)$'
+
+      DECISION TWO: is this documentation only?
+
+      The double negative is the trick. "grep -v" inverts the match, and "!"
+      inverts the result, so together they mean "EVERY changed file matched
+      the documentation pattern". A single .py file in the list and the
+      review proceeds as normal.
+
+  86  git diff -M --unified=3 --no-color ... > pr.diff
+
+      The real diff. --unified=3 gives three lines of context around each
+      change, which is enough to judge a change without inflating the size.
+      --no-color keeps ANSI escape codes out of the prompt.
+
+  88  echo "skip=" >> "$GITHUB_OUTPUT"
+
+      An empty "skip" value is the signal to proceed. Later steps test for
+      skip == ''.
+
+  90  git diff --stat ... >> "$GITHUB_STEP_SUMMARY"
+
+      Writes the diffstat to the run summary, so the Actions page shows what
+      was reviewed without anyone needing to open the log.
+
+
+-------------------------------------------------------------------------------
+Lines 92-115   Secret check and environment setup
+-------------------------------------------------------------------------------
+
+  94  if: steps.diff.outputs.skip == ''
+
+      Skip this step if the diff step already decided to bail out. Each
+      subsequent step chains off the previous step's verdict.
+
+  96-98  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+         if [ -z "${ANTHROPIC_API_KEY}" ]; then
+
+      Secrets cannot be tested directly inside an "if:" expression, so the
+      secret is bound to an environment variable and checked in bash instead.
+      "-z" tests for an empty string.
+
+  99  echo "::warning::ANTHROPIC_API_KEY is not configured..."
+
+      "::warning::" is the GitHub Actions annotation syntax - it surfaces on
+      the run page rather than only in the log. A MISSING KEY IS A WARNING,
+      NOT AN ERROR, so forking this repository does not produce red failing
+      checks for everyone.
+
+ 106  if: steps.key.outputs.present == 'true'
+
+      From here onwards every step is gated on the key existing. No key means
+      no Python install and no API call.
+
+ 109-111  python-version: '3.12' / cache: pip
+          cache-dependency-path: requirements.txt
+
+      Pin the Python version for reproducibility, and cache pip downloads
+      keyed on requirements.txt - so the cache invalidates automatically
+      whenever a dependency changes.
+
+
+-------------------------------------------------------------------------------
+Lines 117-129   Where the two files meet
+-------------------------------------------------------------------------------
+
+ 121  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      The secret is passed as an environment variable - exactly where the
+      script looks for it on line 169.
+
+ 122-123  PR_TITLE / PR_BODY
+
+      THE SECURITY-SENSITIVE PART. Anyone who can open a pull request
+      controls the title and body, so both go through "env". Interpolating
+      ${{ github.event.pull_request.title }} directly into the "run:" block
+      would let a title containing shell metacharacters execute arbitrary
+      commands on the runner.
+
+ 125-129  python scripts/review_pr.py --diff pr.diff --output review.md ...
+
+      The single call that connects the workflow to the script: read pr.diff,
+      write review.md. The quotes around "$PR_TITLE" keep a multi-word title
+      as one argument.
+
+
+-------------------------------------------------------------------------------
+Lines 131-155   One comment, updated in place
+-------------------------------------------------------------------------------
+
+ 132  if: steps.review.outcome == 'success' && hashFiles('review.md') != ''
+
+      Two conditions: the script exited 0, AND review.md actually exists.
+      hashFiles returns an empty string for a missing file, which covers the
+      empty-diff case where the script exits 0 without writing anything.
+
+ 134  GH_TOKEN: ${{ github.token }}
+
+      The gh CLI reads its credentials from GH_TOKEN. This is the automatic
+      token, scoped by the permissions declared on lines 10-11.
+
+ 142-144  MARKER='<!-- ai-pr-review -->'
+
+      An invisible HTML comment is prepended to the comment body. It renders
+      as nothing on GitHub but is findable through the API - the entire
+      update-in-place mechanism depends on it.
+
+ 146-147  EXISTING="$(gh api ... --jq "... startswith(\"$MARKER\") ...")"
+
+      List the pull request's comments and take the id of the first one
+      starting with the marker. --paginate handles PRs with more than one
+      page of comments; "// empty" yields an empty string rather than the
+      literal text "null" when there is no match.
+
+ 149-155  if [ -n "$EXISTING" ]; then PATCH; else POST; fi
+
+      FOUND ONE, UPDATE IT; FOUND NONE, CREATE ONE. This is why a pull
+      request with thirty pushes ends up with one review comment that stays
+      current, instead of thirty stale ones.
+
+ 150  -F body=@comment.md
+
+      Reads the comment body from a file. Passing a long Markdown review as a
+      command-line string would hit argument-length limits and mangle the
+      quoting.
+
+
+-------------------------------------------------------------------------------
+Lines 157-172   Skips and failures
+-------------------------------------------------------------------------------
+
+ 158-160  if: steps.diff.outputs.skip != '' || ...present == 'false'
+
+      Records WHY a review did not happen on the run summary. Without this, a
+      skipped run looks identical to a run that did nothing at all.
+
+ 163  if: failure()
+
+      Runs this step only if an earlier step failed. Normally a failed step
+      halts the job - this is the exception that lets the workflow report its
+      own failure.
+
+ 168  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/...
+
+      Builds the run URL from context variables instead of hardcoding
+      github.com, so the link also works on GitHub Enterprise.
+
+ 171  -f body="<!-- ai-pr-review-error --> The AI review did not finish..."
+
+      Tells the pull request author that something went wrong, rather than
+      failing silently. A red check with no explanation trains people to
+      ignore red checks.
+
+ 172  > /dev/null || echo "::warning::Could not post the failure notice."
+
+      The "|| echo" means that even the failure notice failing cannot
+      cascade. If the token lacks permission to comment, log a warning and
+      stop there.
+
+
+===============================================================================
+3. requirements.txt
+===============================================================================
+
+  anthropic>=0.121.0,<1.0
+
+The single Python dependency, with a version range on both sides:
+
+  >=0.121.0   guarantees the "fallbacks" parameter used on line 150 of
+              review_pr.py exists in the installed SDK
+  <1.0        stops a future 1.0 release, which may contain breaking
+              changes, from landing in CI unannounced
+
+0.121.0 was the current release when this was written.
+
+
+===============================================================================
+4. .gitignore
+===============================================================================
+
+Four groups of entries:
+
+  Python artifacts     __pycache__/, *.py[cod], .venv/, venv/, *.egg-info/
+                       Compiled bytecode and virtual environments, which are
+                       machine-specific and must never be committed.
+
+  Workflow artifacts   pr.diff, review.md, comment.md, changed_files.txt
+                       THE MOST IMPORTANT GROUP. These four files are created
+                       at runtime by the workflow. Committing them would put
+                       a stale review in the repository and cause confusing
+                       diffs on every run.
+
+  Local secrets        .env
+                       Where a developer would keep ANTHROPIC_API_KEY when
+                       running the script locally. Committing this would leak
+                       the key.
+
+  Editors and OS       .vscode/, .idea/, .DS_Store
+                       Personal tooling that should not be shared.
+
+
+===============================================================================
+5. LICENSE
+===============================================================================
+
+The MIT License, copyright 2026, attributed to mirzaqamar007.
+
+MIT is a permissive licence: anyone may use, copy, modify, merge, publish,
+distribute, sublicense and sell the software, with two conditions - the
+copyright notice must travel with it, and the software is provided with no
+warranty of any kind.
+
+
+===============================================================================
+6. README.md
+===============================================================================
+
+The project documentation, aimed at somebody arriving at the repository for
+the first time. Its sections:
+
+  How it works        An ASCII diagram of the pipeline, plus a table naming
+                      the two files that do the work.
+
+  Setup               Three steps - add the ANTHROPIC_API_KEY secret, check
+                      that Actions has write permission, open a pull request.
+
+  What gets reviewed  The excluded paths, the skipped PR types, and the size
+                      caps. Documented because a reviewer that silently
+                      ignores files is worse than no reviewer at all.
+
+  Configuration       A table of the four constants in review_pr.py and what
+                      each one controls.
+
+  Running locally     The three commands needed to run the reviewer by hand
+                      against any diff, without GitHub involved.
+
+  Cost                One review is one API call; the cost scales with the
+                      size of the diff.
+
+  License             Points at the LICENSE file.
+
+
+===============================================================================
+KNOWN GAPS
+===============================================================================
+
+Honest notes about what is not covered or not yet proven:
+
+  * The full skip-logic matrix (code / docs-only / lockfile-only / mixed /
+    generated files) was tested and passed BEFORE the pathspec "glob" fix on
+    line 48 of the workflow. The fix itself was verified independently
+    against a scratch repository, but the complete matrix has not been re-run
+    since. Nothing suggests a regression; it simply has not been re-confirmed.
+
+  * The workflow has never executed on a real pull request. Every component
+    has been tested locally - the script compiles, the trimming logic holds
+    its budget, the API wiring returns a clean 401 with a deliberately
+    invalid key, the YAML parses, and the git pathspecs behave - but the
+    end-to-end run has not happened yet.
+
+  * There is a leftover test file, .github/workflows/README.md, on the main
+    branch, containing the text "This is he third update". It is harmless
+    (GitHub Actions ignores non-YAML files in that directory) but it should
+    be deleted.
+
+===============================================================================
+End of walkthrough.
+===============================================================================
