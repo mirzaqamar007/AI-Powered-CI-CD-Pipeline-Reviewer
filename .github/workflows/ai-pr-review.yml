@@ -75,8 +75,14 @@ jobs:
             exit 0
           fi
 
-          # Prose changes don't need a code review.
-          if ! grep -qvE '(^|/)(docs|\.github)/|\.(md|markdown|rst|txt)$|^(LICENSE|CODEOWNERS)$' changed_files.txt; then
+          # Prose changes don't need a code review. Dependency manifests are the
+          # exception the `.txt` rule below would otherwise swallow: a pinned
+          # version moving is code, and often the only thing in its own PR.
+          DOCS_RE='(^|/)(docs|\.github)/|\.(md|markdown|rst|txt)$|^(LICENSE|CODEOWNERS)$'
+          MANIFEST_RE='(^|/)(requirements[^/]*|constraints[^/]*)\.txt$'
+
+          if ! grep -qE "$MANIFEST_RE" changed_files.txt \
+             && ! grep -qvE "$DOCS_RE" changed_files.txt; then
             echo "Documentation-only change — skipping."
             echo "skip=docs-only" >> "$GITHUB_OUTPUT"
             exit 0
