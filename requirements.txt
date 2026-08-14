@@ -1,3 +1,5 @@
 anthropic>=0.121.0,<1.0
+python 
+HTML
+JAVA Script
 JAVA
-PYTHON
